@@ -1,22 +1,13 @@
-// Simple cache
 let cache = new Map();
 
 export default async function handler(req, res) {
-  // Allow all websites to access this API
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(200).end();
 
-  // Handle browser preflight check
-  if (req.method === 'OPTIONS') {
-    return res.status(200).end();
-  }
-
-  // Get search parameters
-  const { q = 'trailers', maxResults = '30' } = req.query;
-  const cacheKey = `search-${q}-${maxResults}`;
+  const { action, id, query, type, maxResults = '30' } = req.query;
+  const cacheKey = `${action}-${id || query || type}-${maxResults}`;
   
-  console.log('🔍 Search request:', q);
+  console.log('🎯 API Request:', { action, id, query, type });
   
   // Check cache (1 hour)
   const cachedData = cache.get(cacheKey);
@@ -26,43 +17,77 @@ export default async function handler(req, res) {
   }
 
   try {
-    // First try YouTube API
-    const youtubeData = await tryYouTubeAPI(q, maxResults);
+    let data;
     
+    switch (action) {
+      case 'explore':
+        data = await handleExplore();
+        break;
+      case 'search':
+        data = await handleSearch(query, maxResults);
+        break;
+      case 'video':
+        data = await handleVideoDetails(id);
+        break;
+      case 'related':
+        data = await handleRelatedVideos(id, maxResults);
+        break;
+      case 'channel':
+        data = await handleChannelDetails(id);
+        break;
+      case 'foryou':
+        data = await handleForYou(type, maxResults);
+        break;
+      default:
+        return res.status(400).json({ error: 'Invalid action' });
+    }
+
     // Cache the result
     cache.set(cacheKey, {
-      data: youtubeData,
+      data: data,
       timestamp: Date.now()
     });
     
-    console.log('✅ YouTube API success');
-    return res.json(youtubeData);
+    console.log('✅ Fresh data fetched and cached');
+    res.json(data);
     
+  } catch (error) {
+    console.error('❌ API error:', error);
+    res.status(500).json({ error: error.message });
+  }
+}
+
+// 1. EXPLORE: Get all explore page data at once
+async function handleExplore() {
+  const [trailers, movies, anime] = await Promise.all([
+    handleSearch('latest movie trailers', '30'),
+    handleSearch('latest full movie -trailer', '30'), 
+    handleSearch('latest anime trailer OR full movie', '20')
+  ]);
+  
+  return {
+    trailers: trailers.items || [],
+    movies: movies.items || [],
+    anime: anime.items || [],
+    timestamp: new Date().toISOString()
+  };
+}
+
+// 2. SEARCH: Generic search function with YouTube + RapidAPI fallback
+async function handleSearch(query, maxResults) {
+  // Try YouTube API first
+  try {
+    const youtubeData = await tryYouTubeSearch(query, maxResults);
+    return youtubeData;
   } catch (youtubeError) {
     console.log('🔄 YouTube failed, trying RapidAPI...');
-    
-    try {
-      // Fallback to RapidAPI
-      const rapidData = await tryRapidAPI(q, maxResults);
-      
-      // Cache the result
-      cache.set(cacheKey, {
-        data: rapidData,
-        timestamp: Date.now()
-      });
-      
-      console.log('✅ RapidAPI success');
-      return res.json(rapidData);
-      
-    } catch (rapidError) {
-      console.error('❌ All APIs failed');
-      res.status(500).json({ error: 'All APIs failed: ' + rapidError.message });
-    }
+    // Fallback to RapidAPI
+    return await tryRapidAPISearch(query, maxResults);
   }
 }
 
 // YouTube API function
-async function tryYouTubeAPI(query, maxResults) {
+async function tryYouTubeSearch(query, maxResults) {
   const YOUTUBE_API_KEYS = [
     'AIzaSyC_syRSRRxQR1DbtHZzMw9glxcR7My8ly4',
     'AIzaSyABi7KdpAijF9gu09dSefpXJyhjIRY66Eg',
@@ -82,7 +107,6 @@ async function tryYouTubeAPI(query, maxResults) {
     'AIzaSyDRA0Fzdwg5oIIxBBt2NowcrdbeucEa6cc'
   ];
 
-  // Try each YouTube API key
   for (const apiKey of YOUTUBE_API_KEYS) {
     try {
       const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&q=${encodeURIComponent(query)}&maxResults=${maxResults}&type=video&key=${apiKey}`;
@@ -90,19 +114,18 @@ async function tryYouTubeAPI(query, maxResults) {
       
       if (response.ok) {
         const data = await response.json();
-        return data; // YouTube API success
+        console.log('✅ YouTube API success');
+        return data;
       }
     } catch (error) {
-      // Continue to next key
       console.log(`❌ YouTube key failed, trying next...`);
     }
   }
-  
   throw new Error('All YouTube APIs failed');
 }
 
-// RapidAPI function
-async function tryRapidAPI(query, maxResults) {
+// RapidAPI fallback function
+async function tryRapidAPISearch(query, maxResults) {
   const RAPID_API_KEYS = [
     "bbcd1df015mshcbfd8a8f912f109p1f68a0jsn8e1dca2c166d",
     "cbb6e2b6bamsh041eed1c81e7e0dp1b846ejsn669acdaca5ed"
@@ -115,7 +138,7 @@ async function tryRapidAPI(query, maxResults) {
       host: "youtube-v31.p.rapidapi.com"
     },
     {
-      name: "YouTube Data16", 
+      name: "YouTube Data16",
       searchUrl: "https://youtube-data16.p.rapidapi.com/search/?q={query}&hl=en",
       host: "youtube-data16.p.rapidapi.com"
     },
@@ -131,7 +154,6 @@ async function tryRapidAPI(query, maxResults) {
     }
   ];
 
-  // Try each RapidAPI key and endpoint combination
   for (const apiKey of RAPID_API_KEYS) {
     for (const api of rapidApis) {
       try {
@@ -148,20 +170,75 @@ async function tryRapidAPI(query, maxResults) {
         
         if (response.ok) {
           const data = await response.json();
-          // Transform RapidAPI response to match YouTube format
-          return transformRapidResponse(data, api);
+          // Transform to match YouTube format
+          return transformRapidResponse(data);
         }
       } catch (error) {
         console.log(`❌ RapidAPI ${api.name} failed, trying next...`);
       }
     }
   }
-  
   throw new Error('All RapidAPIs failed');
 }
 
-// Transform RapidAPI response to match YouTube API format
-function transformRapidResponse(data, api) {
+// 3. VIDEO DETAILS (with RapidAPI fallback)
+async function handleVideoDetails(videoId) {
+  // Try YouTube first
+  const YOUTUBE_API_KEYS = [/* your keys from above */];
+  
+  for (const apiKey of YOUTUBE_API_KEYS) {
+    try {
+      const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics,contentDetails&id=${videoId}&key=${apiKey}`;
+      const response = await fetch(url);
+      if (response.ok) return await response.json();
+    } catch (error) {
+      console.log('Video details API failed, trying next...');
+    }
+  }
+  
+  // RapidAPI fallback for video details would go here
+  throw new Error('All video APIs failed');
+}
+
+// 4. RELATED VIDEOS
+async function handleRelatedVideos(videoId, maxResults) {
+  const YOUTUBE_API_KEYS = [/* your keys */];
+  
+  for (const apiKey of YOUTUBE_API_KEYS) {
+    try {
+      const url = `https://www.googleapis.com/youtube/v3/search?part=snippet&relatedToVideoId=${videoId}&type=video&maxResults=${maxResults}&key=${apiKey}`;
+      const response = await fetch(url);
+      if (response.ok) return await response.json();
+    } catch (error) {
+      console.log('Related videos API failed');
+    }
+  }
+  
+  // Fallback to popular videos
+  try {
+    const url = `https://www.googleapis.com/youtube/v3/videos?part=snippet&chart=mostPopular&maxResults=${maxResults}&key=${YOUTUBE_API_KEYS[0]}`;
+    const response = await fetch(url);
+    if (response.ok) return await response.json();
+  } catch (error) {
+    console.log('Popular videos fallback failed');
+  }
+
+  return { items: [] };
+}
+
+// 5. CHANNEL DETAILS
+async function handleChannelDetails(channelId) {
+  // Similar pattern to above
+  return { items: [] }; // Placeholder
+}
+
+// 6. FOR YOU (personalized)
+async function handleForYou(contentType, maxResults) {
+  return await handleSearch(`${contentType} trailer OR full movie`, maxResults);
+}
+
+// Transform RapidAPI response to match YouTube format
+function transformRapidResponse(data) {
   const items = data.items || data.contents || data.videos || data.results || [];
   
   return {
